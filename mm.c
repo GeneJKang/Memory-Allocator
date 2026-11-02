@@ -58,8 +58,9 @@
 
 
 //List number
-#define SL_BITS 2
-#define SL_COUNT (1 << SL_BITS) //4 sub lists per power of 2
+#define SL_BITS 4 //set this to 3 for half of table RAM
+#define SL_COUNT (1 << SL_BITS) //16 sub lists per power of 2
+#define HOME_SCAN 2 //blocks find_fit checks in asize's own list before bitmap search
 
 //Row must cover the biggest block the heap can hold
 // 1 GB heap needs 30 and 64 KB heap needs 16
@@ -128,7 +129,7 @@ int mm_init(void)
 
 static void mapping(size_t size, int *fl, int *sl){
     *fl = 31 - __builtin_clz((uint32_t)size);   //highest set bit
-    *sl = (int)((size >> (*fl - SL_BITS)) & (SL_COUNT - 1));    //next 2 bits
+    *sl = (int)((size >> (*fl - SL_BITS)) & (SL_COUNT - 1));    //next 4 bits
 }
 
 static void *extend_heap(size_t words)
@@ -199,6 +200,23 @@ static void *find_fit(size_t asize)
     int fl, sl;
     mapping(asize, &fl, &sl);
     int home_fl = fl, home_sl = sl; //the list asize belongs to
+
+    //Best fit among the first few blocks of asize's own list
+    //Capped at HOME_SCAN blocks so a long list doesn't make malloc slow
+    char *best = NULL;
+    int seen = 0;
+    for (char *bp = free_lists[home_fl][home_sl]; bp != NULL && seen < HOME_SCAN; bp = NEXT_FREE(bp), seen++){
+        size_t s = GET_SIZE(HDRP(bp));
+        if (s >= asize && (best == NULL || s < GET_SIZE(HDRP(best)))){
+            best = bp;
+            if (s == asize){
+                break;  //exact fit, cant do better
+            }
+        }
+    }
+    if (best != NULL){
+        return best;
+    }
 
     //round asize up to the start of the next sub range so every
     //block in the list we start from is guaranteed to fit
