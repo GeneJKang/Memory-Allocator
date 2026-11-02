@@ -1,5 +1,5 @@
-//Explicit free list
-//First fit boundary-tag coalescing
+//TLSF segregated free list with bitmap lookup
+//smallest fit boundary-tag coalescing
 //realloc with trimming
 #include <stdint.h>
 #include <string.h>
@@ -45,13 +45,16 @@
 #define PREV_FREE(bp) (*(char **)((char *)(bp) + DSIZE))
 
 
+//List number
+#define SL_BITS 2
+#define SL_COUNT (1 << SL_BITS) //4 sub lists per power of 2
+#define FL_COUNT 32 //one row per bit of a 32-bit size
+
 
 
 /* Global pointer */
 static char *heap_listp = NULL;
 
-//pointer for head of explicit free list/linked list
-static char *free_listp = NULL;
 
 
 /* Helper function prototypes */
@@ -63,6 +66,11 @@ static void *place(void *bp, size_t asize);
 //Functions for linked list
 static void add_to_free_list(void *bp);
 static void remove_from_free_list(void *bp);
+
+//Data structures for free lists
+static char *free_lists[FL_COUNT][SL_COUNT];    //head of each list
+static uint32_t fl_bitmap;  //bit fl set means some list in row fl is non-empty
+static uint32_t sl_bitmap[FL_COUNT]; //bit sl set means list (fl, sl) is non-empty
 
 
 /*
@@ -84,9 +92,18 @@ int mm_init(void)
     PUT(heap_listp + (3 * WSIZE), PACK(0, 1));      /* Epilogue header */
 
     heap_listp += (2 * WSIZE);
-    free_listp = NULL;  //Init empty free list
+
+    //Empty every free list and clear the bitmaps
+    memset(free_lists, 0, sizeof(free_lists));
+    memset(sl_bitmap, 0, sizeof(sl_bitmap));
+    fl_bitmap = 0;
 
     return 0;
+}
+
+static void mapping(size_t size, int *fl, int *sl){
+    *fl = 31 - __builtin_clz((uint32_t)size);   //highest set bit
+    *sl = (int)((size >> (*fl - SL_BITS)) & (SL_COUNT - 1));    //next 2 bits
 }
 
 static void *extend_heap(size_t words)
@@ -151,17 +168,39 @@ static void *coalesce(void *bp)
 
 static void *find_fit(size_t asize)
 {
-    void *bp;
+    int fl, sl;
+    mapping(asize, &fl, &sl);
+    int home_fl = fl, home_sl = sl; //the list asize belongs to
 
+    //round asize up to the start of the next sub range so every
+    //block in the list we start from is guaranteed to fit
+    size_t rounded = asize + ((size_t)1 << (fl - SL_BITS)) - 1;    
+    if (rounded <= MAX_BLOCK){
+        mapping(rounded, &fl, &sl);
 
-        //use explicit free list to iterate through free blocks in linked lis
-        //Doesnt use heap
-    for (bp = free_listp; bp != NULL; bp = NEXT_FREE(bp)) {
-        if (asize <= GET_SIZE(HDRP(bp))) {
-		return bp;
+        //list in row fl at or above sl
+        uint32_t sl_map = sl_bitmap[fl] & (~0u << sl);
+
+        if (sl_map == 0){
+            //Nothing in the current row so look at rows above it
+            uint32_t fl_map = (fl + 1 < 32) ? (fl_bitmap & (~0u << (fl + 1))) : 0;
+            if (fl_map != 0){
+                fl = __builtin_ctz(fl_map);
+                sl_map = sl_bitmap[fl];
+            }
+        }
+        if(sl_map != 0) {
+            sl = __builtin_ctz(sl_map);
+            return free_lists[fl][sl];   //any block fits here so no checking needed
         }
     }
 
+    //Rounding can skip a block that fits so check asize's own list before giving up
+    for (char *bp = free_lists[home_fl][home_sl]; bp != NULL; bp = NEXT_FREE(bp)) {
+        if (asize <= GET_SIZE(HDRP(bp))) {
+		    return bp;
+        }
+    }
     return NULL;
 }
 
@@ -187,41 +226,23 @@ static void *place(void *bp, size_t asize)
 
     if ((csize - asize) >= (3 * DSIZE)) {
 
-    //Small blocks are placed at the back of a free block and large ones at the front
-    //so leftovers stay together and can merge
-	if (asize >= 96) {
+        //leftovers is big enough to be its own free block
+        //split
 
-            // For large allocations aka allocate at front
-            // Remaining free space towards the back
-            PUT(HDRP(bp), PACK(asize, 1));
-            PUT(FTRP(bp), PACK(asize, 1));
+        PUT(HDRP(bp), PACK(asize, 1));
+        PUT(FTRP(bp), PACK(asize, 1));
 
-            void *remainder = NEXT_BLKP(bp);
-            PUT(HDRP(remainder), PACK(csize - asize, 0));            
+        void *remainder = NEXT_BLKP(bp);
+        PUT(HDRP(remainder), PACK(csize - asize, 0));            
 	    PUT(FTRP(remainder), PACK(csize - asize, 0));
-            add_to_free_list(remainder);
-            return bp;
-        } else {
-
-            //For small allocations aka allocate at back
-            //Remaining free space towards the front
-            PUT(HDRP(bp), PACK(csize - asize, 0));
-            PUT(FTRP(bp), PACK(csize - asize, 0));
-            add_to_free_list(bp);
-
-            bp = NEXT_BLKP(bp);
-            PUT(HDRP(bp), PACK(asize, 1));
-            PUT(FTRP(bp), PACK(asize, 1));
-            return bp;
-        }
-    }
-    else {
+        add_to_free_list(remainder);
+    } else {
+        //Leftovers under 24 bytes cant hold the overhead
+        //so caller gets the whole block
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
-        return bp;
     }
-
-
+    return bp;
 }
 
 //trim an allocated block
@@ -283,36 +304,55 @@ void *mm_malloc(size_t size)
 }
 
 
-//linked list adder/remover for explicit
+//linked list adder/remover
 static void add_to_free_list(void *bp){
 		
-        NEXT_FREE(bp) = free_listp;     //New block points to old head
-        PREV_FREE(bp) = NULL;           //Nothing before the head
+    int fl, sl;
+    mapping(GET_SIZE(HDRP(bp)), &fl, &sl);
 
-        if (free_listp != NULL){
-                PREV_FREE(free_listp) = bp;     //Old head points back to new block
-        }
+    char *head = free_lists[fl][sl];    //LIFO insert per list
+    NEXT_FREE(bp) = head;     //New block points to old head
+    PREV_FREE(bp) = NULL;           //Nothing before the head
 
-        free_listp = bp;
+    if (head != NULL){
+            PREV_FREE(head) = bp;     //Old head points back to new block
+    }
+
+    free_lists[fl][sl] = bp;
+
+    fl_bitmap |= 1u << fl;
+    sl_bitmap[fl] |= 1u << sl;
 
 }
 
 
 static void remove_from_free_list(void *bp){
 
-        char *prev = PREV_FREE(bp);
-        char *next = NEXT_FREE(bp);
+
+    int fl, sl;
+    mapping(GET_SIZE(HDRP(bp)), &fl, &sl);
+
+    char *prev = PREV_FREE(bp);
+    char *next = NEXT_FREE(bp);
 
 
-        if (prev == NULL){
-                free_listp = next;      //bp was the head of the list
-        } else{
-                NEXT_FREE(prev) = next; //prev points to next
+    if (prev == NULL){
+            free_lists[fl][sl] = next;      //bp was the head of the list
+    } else{
+            NEXT_FREE(prev) = next; //prev points to next
+    }
+
+    if (next != NULL){
+            PREV_FREE(next) = prev; //next points to prev
+    }
+
+    if (free_lists[fl][sl] == NULL) {   //clear its bit because list is empty
+        sl_bitmap[fl] &= ~(1u << sl);
+        if (sl_bitmap[fl] == 0){ //whole row is empty so clear row bit
+            fl_bitmap &= ~(1u << fl);
         }
+    }
 
-        if (next != NULL){
-                PREV_FREE(next) = prev; //next points to prev
-        }
 }
 
 
