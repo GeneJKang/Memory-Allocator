@@ -86,6 +86,7 @@ static void *place(void *bp, size_t asize);
 //Functions for linked list
 static void add_to_free_list(void *bp);
 static void remove_from_free_list(void *bp);
+static void mapping(size_t size, int *fl);
 
 //Data structures for free lists
 static char *free_lists[FL_COUNT][SL_COUNT];    //head of each list
@@ -102,8 +103,18 @@ int mm_init(void)
         return -1;  //heap init failed
     }
 
+    //The table must have a row for the biggest block the heap can hold
+    size_t avail = heap_remaining();
+    if (avail >= 4 * WSIZE + MIN_BLOCK){
+        int fl, sl;
+        mapping((avail - 4 * WSIZE) & ~(size_t)0x7, &fl, &sl);
+        if (fl >= FL_COUNT){
+            return -1;  //FL_COUNT is too small for this heap size;
+        }
+    }
+
     if ((heap_listp = heap_sbrk(4 * WSIZE)) == (void *)-1) {
-        return -1;
+        return -1; 
     }
 
     PUT(heap_listp, 0);                              /* Alignment padding */
@@ -200,6 +211,11 @@ static void *find_fit(size_t asize)
     int fl, sl;
     mapping(asize, &fl, &sl);
     int home_fl = fl, home_sl = sl; //the list asize belongs to
+
+    //Check if home_fl goes over FL_COUNT to avoid out-of-bounds access
+    if (home_fl >= FL_COUNT){
+        return NULL;
+    }
 
     //Best fit among the first few blocks of asize's own list
     //Capped at HOME_SCAN blocks so a long list doesn't make malloc slow
