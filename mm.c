@@ -21,35 +21,54 @@
 #define GET(p)       (*(unsigned int *)(p))
 #define PUT(p, val)  (*(unsigned int *)(p) = (val))
 
+//Header flag bits (block sizes are multiples of 8 so the low 3 bits are free)
+#define ALLOC 0x1 //this block is allocated
+#define PREV_ALLOC 0x2 //The block before this one is allocated
 #define GET_SIZE(p)  (GET(p) & ~0x7)
-#define GET_ALLOC(p) (GET(p) & 0x1)
+#define GET_ALLOC(p) (GET(p) & ALLOC)
+#define GET_PREV_ALLOC(p) (GET(p) & PREV_ALLOC)
 
 #define HDRP(bp)       ((char *)(bp) - WSIZE)
+//Only free blocks have a footer so only use FTRP on free blocks
 #define FTRP(bp)       ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
 
 #define NEXT_BLKP(bp)  ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))
+//Read the previous block's footer (only valid when GET_PREV_ALLOC says its free)
 #define PREV_BLKP(bp)  ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
 
 //Header is 32 bits and low 3 bits are flag aka the biggest block that can be described
 #define MAX_BLOCK ((size_t)(UINT32_MAX & ~0x7u))
-//Biggest request that still fits after adding header+footer (DSIZE)
-#define MAX_REQUEST (MAX_BLOCK - DSIZE)
+//Biggest request that still fits after adding header (allocated blocks have no footer)
+#define MAX_REQUEST (MAX_BLOCK - WSIZE)
 
 
 //Pointers for linked list
-//NEXT_FREE is offset 0 from bp and PREV_FREE offset DSIZE from bp
-//Minimum size 24 bytes
+//NEXT_FREE is offset 0 from bp and PREV_FREE offset PTR_SIZE from bp
+//PC (8 byte pointers)
 //4 header + 8 ptr + 8 prev ptr + 4 footer
 
+//Microcontroller (4 byte pointers)
+// 4 header + 4 ptr + 4 prev ptr + 4 footer = 16
+
+#define PTR_SIZE sizeof(void *)
+#define MIN_BLOCK ALIGN(WSIZE + 2 * PTR_SIZE + WSIZE)
+
 #define NEXT_FREE(bp) (*(char **)(bp))
-#define PREV_FREE(bp) (*(char **)((char *)(bp) + DSIZE))
+#define PREV_FREE(bp) (*(char **)((char *)(bp) + PTR_SIZE))
 
 
 //List number
 #define SL_BITS 2
 #define SL_COUNT (1 << SL_BITS) //4 sub lists per power of 2
-#define FL_COUNT 32 //one row per bit of a 32-bit size
 
+//Row must cover the biggest block the heap can hold
+// 1 GB heap needs 30 and 64 KB heap needs 16
+#ifndef FL_COUNT
+#define FL_COUNT 32 //one row per bit of a 32-bit size
+#endif
+#if FL_COUNT > 32
+#error "FL_COUNT can't exceed 32: The bitmaps are 32 bits wide"
+#endif
 
 
 /* Global pointer */
@@ -89,7 +108,7 @@ int mm_init(void)
     PUT(heap_listp, 0);                              /* Alignment padding */
     PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1));  /* Prologue header */
     PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1));  /* Prologue footer */
-    PUT(heap_listp + (3 * WSIZE), PACK(0, 1));      /* Epilogue header */
+    PUT(heap_listp + (3 * WSIZE), PACK(0, PREV_ALLOC | ALLOC));      /* Epilogue header */
 
     heap_listp += (2 * WSIZE);
 
@@ -97,6 +116,12 @@ int mm_init(void)
     memset(free_lists, 0, sizeof(free_lists));
     memset(sl_bitmap, 0, sizeof(sl_bitmap));
     fl_bitmap = 0;
+
+    //Turn the rest of the region into one free block
+    size_t rest = heap_remaining() & ~(size_t)0x7;  //extend_heap needs a multiple of 8
+    if ((rest >= MIN_BLOCK) && (extend_heap(rest / WSIZE) == NULL)) {
+        return -1;
+    }
 
     return 0;
 }
@@ -109,24 +134,23 @@ static void mapping(size_t size, int *fl, int *sl){
 static void *extend_heap(size_t words)
 {
     char *bp;
-    size_t size;
-
-    size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
-
-    if ((long)(bp = heap_sbrk(size)) == -1) {
+    size_t size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
+    if ((long)(bp = heap_sbrk(size)) == -1){
         return NULL;
     }
+    //epilogue's prev alloc bit says whether the last real block is allocated
+    size_t prev_alloc = GET_PREV_ALLOC(HDRP(bp));
 
-    PUT(HDRP(bp), PACK(size, 0));
+    PUT(HDRP(bp), PACK(size, prev_alloc));
     PUT(FTRP(bp), PACK(size, 0));
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, ALLOC));   //new epilogue (block before its free)
 
     return coalesce(bp);
 }
 
 static void *coalesce(void *bp)
 {
-    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
+    size_t prev_alloc = GET_PREV_ALLOC(HDRP(bp));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
 
@@ -138,29 +162,33 @@ static void *coalesce(void *bp)
         remove_from_free_list(NEXT_BLKP(bp));   //Merge with next block
 
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        PUT(HDRP(bp), PACK(size, 0));
+        PUT(HDRP(bp), PACK(size, PREV_ALLOC));
         PUT(FTRP(bp), PACK(size, 0));
     }
     else if (!prev_alloc && next_alloc) {
-
-        remove_from_free_list(PREV_BLKP(bp));   //Merge with prev block
-
-        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
-        PUT(FTRP(bp), PACK(size, 0));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
+        remove_from_free_list(bp);   //Merge with prev block
+
+        //The block before prev is allocated (two free blocks are never neighbors)
+        size += GET_SIZE(HDRP(bp));
+        PUT(HDRP(bp), PACK(size, PREV_ALLOC));
+        PUT(FTRP(bp), PACK(size, 0));
     }
     else {
-
-        remove_from_free_list(PREV_BLKP(bp));
-        remove_from_free_list(NEXT_BLKP(bp));   //Merge prev and next block
-
-        size += GET_SIZE(HDRP(PREV_BLKP(bp))) +
-                GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
+        void *next = NEXT_BLKP(bp);
         bp = PREV_BLKP(bp);
+        remove_from_free_list(bp);
+        remove_from_free_list(next);   //Merge prev and next block
+
+        size += GET_SIZE(HDRP(bp)) +
+                GET_SIZE(HDRP(next));
+        PUT(HDRP(bp), PACK(size, PREV_ALLOC));
+        PUT(FTRP(bp), PACK(size, 0));
     }
+
+    //Whatever follows the merged block now has a free block before it
+    char *after = NEXT_BLKP(bp);
+    PUT(HDRP(after), GET(HDRP(after)) & ~PREV_ALLOC);
 
     add_to_free_list(bp);       //Always add resulting free block to free list
     return bp;
@@ -174,24 +202,30 @@ static void *find_fit(size_t asize)
 
     //round asize up to the start of the next sub range so every
     //block in the list we start from is guaranteed to fit
-    size_t rounded = asize + ((size_t)1 << (fl - SL_BITS)) - 1;    
-    if (rounded <= MAX_BLOCK){
+    //Check if asize + step can wrap past 4 GB
+    size_t step = ((size_t)1 << (fl - SL_BITS)) - 1;    
+    if (asize <= MAX_BLOCK - step){
+        size_t rounded = asize + step;
         mapping(rounded, &fl, &sl);
+        
+        //Rounding can push a request near the heap size into a row past the end of
+        //the table so only search actual rows
+        if (fl < FL_COUNT){
+            //list in row fl at or above sl
+            uint32_t sl_map = sl_bitmap[fl] & (~0u << sl);
 
-        //list in row fl at or above sl
-        uint32_t sl_map = sl_bitmap[fl] & (~0u << sl);
-
-        if (sl_map == 0){
-            //Nothing in the current row so look at rows above it
-            uint32_t fl_map = (fl + 1 < 32) ? (fl_bitmap & (~0u << (fl + 1))) : 0;
-            if (fl_map != 0){
-                fl = __builtin_ctz(fl_map);
-                sl_map = sl_bitmap[fl];
+            if (sl_map == 0){
+                //Nothing in the current row so look at rows above it
+                uint32_t fl_map = (fl + 1 < FL_COUNT) ? (fl_bitmap & (~0u << (fl + 1))) : 0;
+                if (fl_map != 0){
+                    fl = __builtin_ctz(fl_map);
+                    sl_map = sl_bitmap[fl];
+                }
             }
-        }
-        if(sl_map != 0) {
-            sl = __builtin_ctz(sl_map);
-            return free_lists[fl][sl];   //any block fits here so no checking needed
+            if(sl_map != 0) {
+                sl = __builtin_ctz(sl_map);
+                return free_lists[fl][sl];   //any block fits here so no checking needed
+            }
         }
     }
 
@@ -208,10 +242,10 @@ static size_t adjust_size(size_t size){
     if (size > MAX_REQUEST){    //check before adding overhead
         return 0;
     }
-    if (size <= 2 * DSIZE){
-        return 3 * DSIZE;   //minimum block
+    if (size <= MIN_BLOCK - WSIZE){
+        return MIN_BLOCK;   //request fits in the smallest block
     }
-    return ALIGN(size + DSIZE);
+    return ALIGN(size + WSIZE); //allocated blocks only carry a header
 }
 
 
@@ -224,23 +258,26 @@ static void *place(void *bp, size_t asize)
     size_t csize = GET_SIZE(HDRP(bp));
     remove_from_free_list(bp);
 
-    if ((csize - asize) >= (3 * DSIZE)) {
+    if ((csize - asize) >= MIN_BLOCK) {
 
         //leftovers is big enough to be its own free block
         //split
 
-        PUT(HDRP(bp), PACK(asize, 1));
-        PUT(FTRP(bp), PACK(asize, 1));
+        PUT(HDRP(bp), PACK(asize, PREV_ALLOC | ALLOC)); //no footer on allocated blocks
 
         void *remainder = NEXT_BLKP(bp);
-        PUT(HDRP(remainder), PACK(csize - asize, 0));            
+        PUT(HDRP(remainder), PACK(csize - asize, PREV_ALLOC));            
 	    PUT(FTRP(remainder), PACK(csize - asize, 0));
         add_to_free_list(remainder);
+        //Block after the remainder already has PREV_ALLOC clear (it follows a free block)
     } else {
-        //Leftovers under 24 bytes cant hold the overhead
+        //Leftovers under MIN_BLOCK bytes cant hold the overhead
         //so caller gets the whole block
-        PUT(HDRP(bp), PACK(csize, 1));
-        PUT(FTRP(bp), PACK(csize, 1));
+        PUT(HDRP(bp), PACK(csize, PREV_ALLOC | ALLOC));
+
+        //The block after now follows an allocated block
+        char *next = NEXT_BLKP(bp);
+        PUT(HDRP(next), GET(HDRP(next)) | PREV_ALLOC);
     }
     return bp;
 }
@@ -250,17 +287,16 @@ static void trim_block(void *bp, size_t asize){
     size_t csize = GET_SIZE(HDRP(bp));
     size_t leftover = csize - asize;
 
-    if (leftover < (3 * DSIZE)) {   //Block is too small to be trimmed
+    if (leftover < MIN_BLOCK) {   //Block is too small to be trimmed
         return;
     }
 
     // Shrink the block via new header
-    PUT(HDRP(bp), PACK(asize, 1));
-    PUT(FTRP(bp), PACK(asize, 1));
+    PUT(HDRP(bp), PACK(asize, GET_PREV_ALLOC(HDRP(bp)) | ALLOC));
 
     //tail (remainder) starts right after the trimmed block
     void *remainder = NEXT_BLKP(bp);
-    PUT(HDRP(remainder), PACK(leftover, 0));            
+    PUT(HDRP(remainder), PACK(leftover, PREV_ALLOC));            
     PUT(FTRP(remainder), PACK(leftover, 0));
     
     //Coalesce the tail with free neighbor (if it exists) and adds to free list
@@ -293,8 +329,7 @@ void *mm_malloc(size_t size)
     }    
 
 
-
-        //No fit found so extend the heap
+    //No fit found so extend the heap
     extendsize = MAX(asize, CHUNKSIZE);
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL) {
         return NULL;
@@ -370,9 +405,9 @@ void mm_free(void *ptr)
     }
 
     size_t size = GET_SIZE(HDRP(ptr));
-    PUT(HDRP(ptr), PACK(size, 0));
+    PUT(HDRP(ptr), PACK(size, GET_PREV_ALLOC(HDRP(ptr))));
     PUT(FTRP(ptr), PACK(size, 0));
-    coalesce(ptr);
+    coalesce(ptr);  //clear PREV_ALLOC in the next block
 }
 
 //realloc
@@ -412,8 +447,11 @@ void *mm_realloc(void *ptr, size_t size)
 	    //Combine next free block
         remove_from_free_list(next);
 
-        PUT(HDRP(ptr), PACK(combined, 1));
-        PUT(FTRP(ptr), PACK(combined, 1));
+        PUT(HDRP(ptr), PACK(combined, GET_PREV_ALLOC(HDRP(ptr)) | ALLOC));
+        
+        //the block after the merged block used to follow a free block
+        char *after = NEXT_BLKP(ptr);
+        PUT(HDRP(after), GET(HDRP(after)) | PREV_ALLOC);
         trim_block(ptr, asize);
         return ptr;
     }
@@ -427,9 +465,8 @@ void *mm_realloc(void *ptr, size_t size)
 		return NULL;
 	}
 	
-	PUT(HDRP(ptr), PACK(asize, 1));
-	PUT(FTRP(ptr), PACK(asize, 1));
-	PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1));
+	PUT(HDRP(ptr), PACK(asize, GET_PREV_ALLOC(HDRP(ptr)) | ALLOC));
+	PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, PREV_ALLOC | ALLOC)); //new epilogue after an allocated block
 	return ptr;
     }
 
@@ -440,7 +477,7 @@ void *mm_realloc(void *ptr, size_t size)
         return NULL;
     }
 
-    oldsize = GET_SIZE(HDRP(ptr)) - DSIZE;
+    oldsize = GET_SIZE(HDRP(ptr)) - WSIZE;  //payload = block - header
     size_t copySize = (size < oldsize) ? size : oldsize;
     memcpy(newptr, ptr, copySize);
     mm_free(ptr);

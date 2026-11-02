@@ -15,4 +15,7 @@ void *heap_sbrk(size_t incr);
 void *heap_lo(void);
 void *heap_hi(void);
 
+//Bytes of the region not yet allocated
+size_t heap_remaining(void);
+
 #endif

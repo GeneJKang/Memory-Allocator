@@ -67,3 +67,8 @@ void *heap_lo(void){
 void *heap_hi(void){
     return pbrk_ptr - 1;    //pbrk_ptr is one past the last used byte
 }
+
+
+size_t heap_remaining(void){
+    return (size_t)(end - pbrk_ptr);    //return remaining unallocated memory
+}
