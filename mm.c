@@ -32,11 +32,15 @@
 #define PREV_ALLOC 0x2 //The block before this one is allocated
 
 //header flag macros for size alignment
-#if defined(MM_SIZE_ALIGN) && UINTPTR_MAX == 0xFFFFFFFFu
+#if (defined(MM_SIZE_ALIGN) || defined(MM_ALIGN4)) && UINTPTR_MAX == 0xFFFFFFFFu
 #define HYB 1
 #define GET_SIZE(p) (GET(p) & ~0x3) //4 byte grid
+#ifdef MM_ALIGN4
+#define STRICT(n) 0 //Every size uses a 4-byte grid (ESP32)
+#else
 //size divisible by 8 must start on a 8-byte boundary
 #define STRICT(n) (((n) & 7) == 0)
+#endif
 #define PAD_MARK 0x1u
 #else
 #define GET_SIZE(p) (GET(p) & ~0x7)
@@ -60,7 +64,7 @@
 #define MAX_REQUEST (MAX_BLOCK - WSIZE)
 
 //Pointers for linked list
-//NEXT_FREE is offset 0 from bp and PREV_FREE offset PTR_SIZE from bp
+//NEXT_FREE is offset 0 from bp and PPREV_FREE offset PTR_SIZE from bp
 //PC (8 byte pointers)
 //4 header + 8 ptr + 8 prev ptr + 4 footer
 
@@ -71,7 +75,16 @@
 #define MIN_BLOCK ALIGN(WSIZE + 2 * PTR_SIZE + WSIZE)
 
 #define NEXT_FREE(bp) (*(char **)(bp))
-#define PREV_FREE(bp) (*(char **)((char *)(bp) + PTR_SIZE))
+#define PPREV_FREE(bp) (*(char ***)((char *)(bp) + PTR_SIZE))
+
+//Every list ends at this sentinel instead of NULL so the list code
+//never needs to test for NULL
+//[0] is the sentinels header (always 0)
+//[1] is the NEXT_FREE and points back to itself
+//[2] is PPREV_FREE 
+static char *nil_area[3];
+#define NIL ((char *)&nil_area[1])
+
 
 
 //List number
@@ -101,7 +114,7 @@ static void *find_fit(size_t asize);
 static void *place(void *bp, size_t asize);
 
 //Functions for linked list
-static void add_to_free_list(void *bp);
+static void add_to_free_list(void *bp, size_t size);
 static void remove_from_free_list(void *bp);
 static void mapping(size_t size, int *fl, int *sl);
 
@@ -142,7 +155,13 @@ int mm_init(void)
     heap_listp += (2 * WSIZE);
 
     //Empty every free list and clear the bitmaps
-    memset(free_lists, 0, sizeof(free_lists));
+    nil_area[0] = 0;
+    nil_area[1] = NIL;
+    for (int i = 0; i < FL_COUNT; i++){
+        for(int j = 0; j < SL_COUNT; j++){
+            free_lists[i][j] = NIL;
+        }
+    }
     memset(sl_bitmap, 0, sizeof(sl_bitmap));
     fl_bitmap = 0;
 
@@ -180,46 +199,31 @@ static void *extend_heap(size_t words)
 static void *coalesce(void *bp)
 {
     size_t prev_alloc = GET_PREV_ALLOC(HDRP(bp));
-    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
+    char *next = (char *)bp + size;
 
-    if (prev_alloc && next_alloc) {
-        //No merge needed, fall through to add_to_free_list function
+    if (!GET_ALLOC(HDRP(next))) {
+
+        remove_from_free_list(next);   //Merge with next block
+
+        size += GET_SIZE(HDRP(next));
     }
-    else if (prev_alloc && !next_alloc) {
-
-        remove_from_free_list(NEXT_BLKP(bp));   //Merge with next block
-
-        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        PUT(HDRP(bp), PACK(size, PREV_ALLOC));
-        PUT(FTRP(bp), PACK(size, 0));
-    }
-    else if (!prev_alloc && next_alloc) {
-        bp = PREV_BLKP(bp);
+    if (!prev_alloc) {
+        size_t prev_size = GET_SIZE((char *)bp - DSIZE);
+        bp = (char *)bp - prev_size;
         remove_from_free_list(bp);   //Merge with prev block
 
         //The block before prev is allocated (two free blocks are never neighbors)
-        size += GET_SIZE(HDRP(bp));
-        PUT(HDRP(bp), PACK(size, PREV_ALLOC));
-        PUT(FTRP(bp), PACK(size, 0));
+        size += prev_size;
     }
-    else {
-        void *next = NEXT_BLKP(bp);
-        bp = PREV_BLKP(bp);
-        remove_from_free_list(bp);
-        remove_from_free_list(next);   //Merge prev and next block
-
-        size += GET_SIZE(HDRP(bp)) +
-                GET_SIZE(HDRP(next));
-        PUT(HDRP(bp), PACK(size, PREV_ALLOC));
-        PUT(FTRP(bp), PACK(size, 0));
-    }
+    PUT(HDRP(bp), PACK(size, PREV_ALLOC));
+    PUT((char *)bp + size - DSIZE, PACK(size, 0));
 
     //Whatever follows the merged block now has a free block before it
-    char *after = NEXT_BLKP(bp);
+    char *after = (char *)bp + size;
     PUT(HDRP(after), GET(HDRP(after)) & ~PREV_ALLOC);
 
-    add_to_free_list(bp);       //Always add resulting free block to free list
+    add_to_free_list(bp, size);       //Always add resulting free block to free list
     return bp;
 }
 
@@ -236,18 +240,22 @@ static void *find_fit(size_t asize)
 
     //Best fit among the first few blocks of asize's own list
     //Capped at HOME_SCAN blocks so a long list doesn't make malloc slow
-    char *best = NULL;
-    int seen = 0;
-    for (char *bp = free_lists[home_fl][home_sl]; bp != NULL && seen < HOME_SCAN; bp = NEXT_FREE(bp), seen++){
+    //Reading past the end of a short list lands on NIL (whose size is 0) so it never
+    //fits and the loop needs no NULL test.
+    char *best = NIL;
+    size_t best_size = (size_t)-1;
+    char *bp = free_lists[home_fl][home_sl];
+    for (int seen = 0; seen < HOME_SCAN; bp = NEXT_FREE(bp), seen++){
         size_t s = GET_SIZE(HDRP(bp));
-        if (s >= asize && (best == NULL || s < GET_SIZE(HDRP(best)))){
+        if (s >= asize && s < best_size){
             best = bp;
+            best_size = s;
             if (s == asize){
                 break;  //exact fit, cant do better
             }
         }
     }
-    if (best != NULL){
+    if (best != NIL){
         return best;
     }
 
@@ -281,7 +289,7 @@ static void *find_fit(size_t asize)
     }
 
     //Rounding can skip a block that fits so check asize's own list before giving up
-    for (char *bp = free_lists[home_fl][home_sl]; bp != NULL; bp = NEXT_FREE(bp)) {
+    for (char *bp = free_lists[home_fl][home_sl]; bp != NIL; bp = NEXT_FREE(bp)) {
         if (asize <= GET_SIZE(HDRP(bp))) {
 		    return bp;
         }
@@ -305,7 +313,7 @@ static void *place(void *bp, size_t asize)
         void *remainder = NEXT_BLKP(bp);
         PUT(HDRP(remainder), PACK(csize - asize, PREV_ALLOC));            
 	    PUT(FTRP(remainder), PACK(csize - asize, 0));
-        add_to_free_list(remainder);
+        add_to_free_list(remainder, csize - asize);
         //Block after the remainder already has PREV_ALLOC clear (it follows a free block)
     } else {
         //Leftovers under MIN_BLOCK bytes cant hold the overhead
@@ -342,47 +350,37 @@ static void trim_block(void *bp, size_t asize){
 }
 
 //linked list adder/remover
-static void add_to_free_list(void *bp){
+static inline __attribute__((always_inline)) void add_to_free_list(void *bp, size_t size){
 		
     int fl, sl;
-    mapping(GET_SIZE(HDRP(bp)), &fl, &sl);
+    mapping(size, &fl, &sl);
 
-    char *head = free_lists[fl][sl];    //LIFO insert per list
+    char **slot = &free_lists[fl][sl];
+    char *head = *slot;    //LIFO insert per list
     NEXT_FREE(bp) = head;     //New block points to old head
-    PREV_FREE(bp) = NULL;           //Nothing before the head
+    PPREV_FREE(bp) = slot;
+    PPREV_FREE(head) = (char **)bp; //writes into the sentinel if the list is empty
 
-    if (head != NULL){
-            PREV_FREE(head) = bp;     //Old head points back to new block
-    }
-
-    free_lists[fl][sl] = bp;
+    *slot = bp;
 
     fl_bitmap |= 1u << fl;
     sl_bitmap[fl] |= 1u << sl;
 
 }
 
-static void remove_from_free_list(void *bp){
+static inline __attribute__((always_inline)) void remove_from_free_list(void *bp){
 
-
-    int fl, sl;
-    mapping(GET_SIZE(HDRP(bp)), &fl, &sl);
-
-    char *prev = PREV_FREE(bp);
+    char **pprev = PPREV_FREE(bp);
     char *next = NEXT_FREE(bp);
+    *pprev = next;      //head slot or previous block now skips bp
+    PPREV_FREE(next) = pprev;  //writes into the sentinel if bp was the last one
 
-
-    if (prev == NULL){
-            free_lists[fl][sl] = next;      //bp was the head of the list
-    } else{
-            NEXT_FREE(prev) = next; //prev points to next
-    }
-
-    if (next != NULL){
-            PREV_FREE(next) = prev; //next points to prev
-    }
-
-    if (free_lists[fl][sl] == NULL) {   //clear its bit because list is empty
+    //idx is pprev's position in free_lists
+    //it is out of range when pprev is a block, not a slot
+    size_t idx = ((size_t)(uintptr_t)pprev - (uintptr_t)&free_lists[0][0]) / sizeof(char *);
+    if (next == NIL && idx < FL_COUNT * SL_COUNT){
+        int fl = (int)(idx >> SL_BITS);
+        int sl = (int)(idx & (SL_COUNT - 1));
         sl_bitmap[fl] &= ~(1u << sl);
         if (sl_bitmap[fl] == 0){ //whole row is empty so clear row bit
             fl_bitmap &= ~(1u << fl);
@@ -465,11 +463,7 @@ void mm_free(void *ptr)
     if (ptr == NULL) {
         return;
     }
-
-    size_t size = GET_SIZE(HDRP(ptr));
-    PUT(HDRP(ptr), PACK(size, GET_PREV_ALLOC(HDRP(ptr))));
-    PUT(FTRP(ptr), PACK(size, 0));
-    coalesce(ptr);  //clear PREV_ALLOC in the next block
+    coalesce(ptr);  //clear PREV_ALLOC in the next block and write free block's header and footer
 }
 
 //realloc
@@ -622,11 +616,7 @@ void mm_free(void *ptr)
     if (shifted(ptr)){
         ptr = (char *)ptr - 4;
     }
-
-    size_t size = GET_SIZE(HDRP(ptr));
-    PUT(HDRP(ptr), PACK(size, GET_PREV_ALLOC(HDRP(ptr))));
-    PUT(FTRP(ptr), PACK(size, 0));
-    coalesce(ptr);  //clear PREV_ALLOC in the next block
+    coalesce(ptr);  //clear PREV_ALLOC in the next block and write free block's header and footer
 }
 
 
@@ -710,5 +700,4 @@ void *mm_realloc(void *ptr, size_t size)
 }
 
 #endif
-
 
