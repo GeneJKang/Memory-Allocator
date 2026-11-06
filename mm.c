@@ -8,6 +8,10 @@
 #include "mm.h"
 #include "heap.h"
 
+
+
+
+
 /* Basic constants and macros */
 #define WSIZE       4
 #define DSIZE       8
@@ -22,11 +26,25 @@
 #define PUT(p, val)  (*(unsigned int *)(p) = (val))
 
 //Header flag bits (block sizes are multiples of 8 so the low 3 bits are free)
+//^ This applies to default build
+//With MM_SIZE_ALIGN, sizes are multiples of 4 and only the low 2 bits are free
 #define ALLOC 0x1 //this block is allocated
 #define PREV_ALLOC 0x2 //The block before this one is allocated
-#define GET_SIZE(p)  (GET(p) & ~0x7)
+
+//header flag macros for size alignment
+#if defined(MM_SIZE_ALIGN) && UINTPTR_MAX == 0xFFFFFFFFu
+#define HYB 1
+#define GET_SIZE(p) (GET(p) & ~0x3) //4 byte grid
+//size divisible by 8 must start on a 8-byte boundary
+#define STRICT(n) (((n) & 7) == 0)
+#define PAD_MARK 0x1u
+#else
+#define GET_SIZE(p) (GET(p) & ~0x7)
+#endif
+
 #define GET_ALLOC(p) (GET(p) & ALLOC)
 #define GET_PREV_ALLOC(p) (GET(p) & PREV_ALLOC)
+
 
 #define HDRP(bp)       ((char *)(bp) - WSIZE)
 //Only free blocks have a footer so only use FTRP on free blocks
@@ -40,7 +58,6 @@
 #define MAX_BLOCK ((size_t)(UINT32_MAX & ~0x7u))
 //Biggest request that still fits after adding header (allocated blocks have no footer)
 #define MAX_REQUEST (MAX_BLOCK - WSIZE)
-
 
 //Pointers for linked list
 //NEXT_FREE is offset 0 from bp and PREV_FREE offset PTR_SIZE from bp
@@ -86,7 +103,7 @@ static void *place(void *bp, size_t asize);
 //Functions for linked list
 static void add_to_free_list(void *bp);
 static void remove_from_free_list(void *bp);
-static void mapping(size_t size, int *fl);
+static void mapping(size_t size, int *fl, int *sl);
 
 //Data structures for free lists
 static char *free_lists[FL_COUNT][SL_COUNT];    //head of each list
@@ -272,20 +289,6 @@ static void *find_fit(size_t asize)
     return NULL;
 }
 
-static size_t adjust_size(size_t size){
-    if (size > MAX_REQUEST){    //check before adding overhead
-        return 0;
-    }
-    if (size <= MIN_BLOCK - WSIZE){
-        return MIN_BLOCK;   //request fits in the smallest block
-    }
-    return ALIGN(size + WSIZE); //allocated blocks only carry a header
-}
-
-
-
-
-
 static void *place(void *bp, size_t asize)
 {
 
@@ -338,6 +341,87 @@ static void trim_block(void *bp, size_t asize){
 
 }
 
+//linked list adder/remover
+static void add_to_free_list(void *bp){
+		
+    int fl, sl;
+    mapping(GET_SIZE(HDRP(bp)), &fl, &sl);
+
+    char *head = free_lists[fl][sl];    //LIFO insert per list
+    NEXT_FREE(bp) = head;     //New block points to old head
+    PREV_FREE(bp) = NULL;           //Nothing before the head
+
+    if (head != NULL){
+            PREV_FREE(head) = bp;     //Old head points back to new block
+    }
+
+    free_lists[fl][sl] = bp;
+
+    fl_bitmap |= 1u << fl;
+    sl_bitmap[fl] |= 1u << sl;
+
+}
+
+static void remove_from_free_list(void *bp){
+
+
+    int fl, sl;
+    mapping(GET_SIZE(HDRP(bp)), &fl, &sl);
+
+    char *prev = PREV_FREE(bp);
+    char *next = NEXT_FREE(bp);
+
+
+    if (prev == NULL){
+            free_lists[fl][sl] = next;      //bp was the head of the list
+    } else{
+            NEXT_FREE(prev) = next; //prev points to next
+    }
+
+    if (next != NULL){
+            PREV_FREE(next) = prev; //next points to prev
+    }
+
+    if (free_lists[fl][sl] == NULL) {   //clear its bit because list is empty
+        sl_bitmap[fl] &= ~(1u << sl);
+        if (sl_bitmap[fl] == 0){ //whole row is empty so clear row bit
+            fl_bitmap &= ~(1u << fl);
+        }
+    }
+
+}
+
+//contiguous allocation
+//initialize all allocation to 0
+void *mm_calloc(size_t n, size_t size){
+    size_t total;
+    //&total is a pointer to the value n * size
+    //returns true if overflowed
+    if (__builtin_mul_overflow(n, size, &total)){   //does not fit in size_t
+        errno = ENOMEM;
+        return NULL;
+    }
+    void *p = mm_malloc(total);
+    if (p != NULL){
+        memset(p, 0, total);
+    }
+    return p;
+}
+
+
+
+#ifndef HYB
+
+static size_t adjust_size(size_t size){
+    if (size > MAX_REQUEST){    //check before adding overhead
+        return 0;
+    }
+    if (size <= MIN_BLOCK - WSIZE){
+        return MIN_BLOCK;   //request fits in the smallest block
+    }
+    return ALIGN(size + WSIZE); //allocated blocks only carry a header
+}
+
 /*
  * mm_malloc - Allocate a block.
  */
@@ -371,62 +455,6 @@ void *mm_malloc(size_t size)
 
     return place(bp, asize);
 }
-
-
-//linked list adder/remover
-static void add_to_free_list(void *bp){
-		
-    int fl, sl;
-    mapping(GET_SIZE(HDRP(bp)), &fl, &sl);
-
-    char *head = free_lists[fl][sl];    //LIFO insert per list
-    NEXT_FREE(bp) = head;     //New block points to old head
-    PREV_FREE(bp) = NULL;           //Nothing before the head
-
-    if (head != NULL){
-            PREV_FREE(head) = bp;     //Old head points back to new block
-    }
-
-    free_lists[fl][sl] = bp;
-
-    fl_bitmap |= 1u << fl;
-    sl_bitmap[fl] |= 1u << sl;
-
-}
-
-
-static void remove_from_free_list(void *bp){
-
-
-    int fl, sl;
-    mapping(GET_SIZE(HDRP(bp)), &fl, &sl);
-
-    char *prev = PREV_FREE(bp);
-    char *next = NEXT_FREE(bp);
-
-
-    if (prev == NULL){
-            free_lists[fl][sl] = next;      //bp was the head of the list
-    } else{
-            NEXT_FREE(prev) = next; //prev points to next
-    }
-
-    if (next != NULL){
-            PREV_FREE(next) = prev; //next points to prev
-    }
-
-    if (free_lists[fl][sl] == NULL) {   //clear its bit because list is empty
-        sl_bitmap[fl] &= ~(1u << sl);
-        if (sl_bitmap[fl] == 0){ //whole row is empty so clear row bit
-            fl_bitmap &= ~(1u << fl);
-        }
-    }
-
-}
-
-
-
-
 
 
 /*
@@ -519,22 +547,168 @@ void *mm_realloc(void *ptr, size_t size)
     return newptr;
 }
 
-//contiguous allocation
-//initialize all allocation to 0
-void *mm_calloc(size_t n, size_t size){
-    size_t total;
-    //&total is a pointer to the value n * size
-    //returns true if overflowed
-    if (__builtin_mul_overflow(n, size, &total)){   //does not fit in size_t
+#endif
+
+
+
+#ifdef HYB
+//Sizes not divisible by 8 are rounded to 4
+//Sizes divisible by 8 are kept with 8 byte
+
+static size_t sa_adjust_size(size_t size){
+    if (size > MAX_REQUEST){
+        return 0;
+    }
+    if (size <= MIN_BLOCK - WSIZE){
+        return MIN_BLOCK;
+    }
+    if (!STRICT(size)){
+        return (size + WSIZE + 3) & ~(size_t)3;
+    }
+    return ALIGN(size + WSIZE);
+}
+
+//if p is shifted then its this returns true
+//check PAD_MARK field
+static int shifted(char *p){
+    return GET_SIZE(HDRP(p)) == 0;
+}
+
+//allocate size bytes and returns a pointer to them or NULL if not enough room
+void *mm_malloc(size_t size)
+{
+    size_t asize;
+    size_t extendsize;
+    char *bp;
+
+    if (heap_listp == NULL && mm_init() < 0){   //init malloc
+        return NULL;    //init malloc failed
+    }
+
+    if (size == 0) {
+        return NULL;
+    }
+    if ((asize = sa_adjust_size(size)) == 0){
         errno = ENOMEM;
         return NULL;
     }
-    void *p = mm_malloc(total);
-    if (p != NULL){
-        memset(p, 0, total);
+    if ((bp = find_fit(asize)) != NULL) {
+        bp = place(bp, asize);
+    }else {
+        //No fit found so extend the heap
+        extendsize = MAX(asize, CHUNKSIZE);
+        if ((bp = extend_heap(extendsize / WSIZE)) == NULL) {
+            return NULL;
+        }
+        bp = place(bp, asize);
+    }   
+
+    //If the request needs 8-byte alignment but the data is 4 bytes off
+    //move it forward into the space 4 bytes and mark the gap for mm_free
+    if (STRICT(size) && (uintptr_t) bp % 8 != 0){
+        PUT(bp, PAD_MARK);
+        bp += 4;
     }
-    return p;
+
+    return bp;
 }
 
+//If the data was shifted the pointer is first moved back 4 bytes to the block's actual start
+void mm_free(void *ptr)
+{
+    if (ptr == NULL) {
+        return;
+    }
+    if (shifted(ptr)){
+        ptr = (char *)ptr - 4;
+    }
+
+    size_t size = GET_SIZE(HDRP(ptr));
+    PUT(HDRP(ptr), PACK(size, GET_PREV_ALLOC(HDRP(ptr))));
+    PUT(FTRP(ptr), PACK(size, 0));
+    coalesce(ptr);  //clear PREV_ALLOC in the next block
+}
+
+
+
+
+void *mm_realloc(void *ptr, size_t size)
+{
+    if (ptr == NULL) {
+        return mm_malloc(size);
+    }
+
+    if (size == 0) {
+        mm_free(ptr);
+        return NULL;
+    }
+
+    size_t asize = sa_adjust_size(size);
+    if (asize == 0){    //too big so fail and leave old block untouched
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    char *p = ptr;
+
+    //the block's actual start if shifted
+    char *bp = shifted(p) ? p - 4 : p;
+
+    //How many bytes the caller can use (counted from p to the end of the block)
+    size_t usable = GET_SIZE(HDRP(bp)) - WSIZE - (size_t)(p - bp);
+    size_t oldsize = GET_SIZE (HDRP(bp));
+    
+    //Check weither p is aligned well enough for the new size to stay at the same address
+    int aligned_ok = !STRICT(size) || (uintptr_t)p % 8 == 0;
+
+    if (bp == p && aligned_ok){
+        //The block is already big enough so shrink it in place and give the leftover tail back
+        if (oldsize >= asize){
+            trim_block(bp, asize);
+            return bp;
+        }
+
+        //The block after this one is free and the two together are big enough
+        //merge them and then give back whatever is leftover
+        void *next = NEXT_BLKP(bp);
+        size_t next_size = GET_SIZE(HDRP(next));
+        size_t combined = oldsize + next_size;
+        
+        //Check if next block is free and combined size is big enough to fit
+        if (!GET_ALLOC(HDRP(next)) && combined >= asize){
+            //Combine next free block
+            remove_from_free_list(next);
+
+            PUT(HDRP(bp), PACK(combined, GET_PREV_ALLOC(HDRP(bp)) | ALLOC));
+            
+            //the block after the merged block used to follow a free block
+            char *after = NEXT_BLKP(bp);
+            PUT(HDRP(after), GET(HDRP(after)) | PREV_ALLOC);
+            trim_block(bp, asize);
+            return bp;
+        }
+    } else if (aligned_ok && size <= usable){
+        //A shifted block that is still big enough to stay where it is
+        //It is not trimmed
+        return p;
+    }
+
+
+    //None of the in-place options work so move the data
+    //get a new block, copy as much of the old contents as fits, then free the old block
+    //If no new block is available, the old one is kept
+    void *newptr = mm_malloc(size);
+    if (newptr == NULL) {
+        return NULL;
+    }
+
+    size_t copySize = (size < usable) ? size : usable;
+    memcpy(newptr, p, copySize);
+    mm_free(p);
+
+    return newptr;
+}
+
+#endif
 
 
