@@ -174,7 +174,7 @@ The hybrid version gains the most benefit on small blocks because of it's abilit
 
 The lead lasts across different mixed heap sizes. On a 16 KB heap the reference TLSF loses significantly more because its 3.2 KB control table exists inside the heap, while MM keeps its table in normal RAM.
 
-<img width="1760" height="696" alt="heap-size-dark" src="https://github.com/user-attachments/assets/3586c2c1-3daf-4d6d-b546-ed4ae16f0290" />
+<img width="1760" height="784" alt="heap-size-dark" src="https://github.com/user-attachments/assets/e9f143f7-a823-4704-8ebc-189a199f902d" />
 
 | Mixed Sizes | **MM (Standard)** | **MM (Hybrid)** | TLSF (ESP32) | heap_4 (FreeRTOS) | newlib-nano (STM32) |
 | --- | --- | --- | --- | --- | --- |
